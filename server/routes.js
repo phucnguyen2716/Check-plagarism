@@ -6,8 +6,24 @@ import {
   fetchPageContent,
   nGramSimilarity,
 } from "./plagiarism.js";
+import multer from "multer";
+import WordExtractor from "word-extractor";
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 export function registerRoutes(app) {
+  app.post("/api/extract-doc", upload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+      const extractor = new WordExtractor();
+      const extracted = await extractor.extract(req.file.buffer);
+      res.json({ text: extracted.getBody() });
+    } catch (error) {
+      console.error("Doc extraction error:", error);
+      res.status(500).json({ error: "Failed to extract doc file" });
+    }
+  });
+
   app.post("/api/plagiarism-check", async (req, res) => {
     try {
       const { text } = checkTextSchema.parse(req.body);
@@ -22,7 +38,10 @@ export function registerRoutes(app) {
       console.log("Split into", sentences.length, "sentences");
 
       const results = [];
-      const limit = Math.min(sentences.length, 20);
+      const limit = sentences.length;
+
+      res.setHeader('Content-Type', 'application/x-ndjson');
+      res.setHeader('Transfer-Encoding', 'chunked');
 
       for (let i = 0; i < limit; i++) {
         const sentence = sentences[i];
@@ -70,6 +89,8 @@ export function registerRoutes(app) {
           isPlagiarized: maxSimilarity > 0.5,
         });
 
+        res.write(JSON.stringify({ type: 'progress', progress: Math.round(((i + 1) / limit) * 100) }) + '\n');
+
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
@@ -90,12 +111,18 @@ export function registerRoutes(app) {
         results,
       };
 
-      res.json(checkResult);
+      res.write(JSON.stringify({ type: 'complete', result: checkResult }) + '\n');
+      res.end();
     } catch (error) {
       console.error("Error in plagiarism check:", error);
-      res.status(500).json({
-        error: error instanceof Error ? error.message : "An unknown error occurred",
-      });
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: error instanceof Error ? error.message : "An unknown error occurred",
+        });
+      } else {
+        res.write(JSON.stringify({ type: 'error', error: "Internal Server Error" }) + '\n');
+        res.end();
+      }
     }
   });
 

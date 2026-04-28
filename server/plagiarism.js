@@ -20,22 +20,26 @@ export async function searchWeb(query) {
   const urls = [];
 
   try {
-    const searchQuery = encodeURIComponent(query.slice(0, 200));
+    const searchQuery = encodeURIComponent(query.slice(0, 240));
     const ddgUrl = `https://html.duckduckgo.com/html/?q=${searchQuery}`;
 
     const response = await fetch(ddgUrl, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
       },
     });
 
     const html = await response.text();
 
-    const resultMatches = html.match(/uddg=([^"&]+)/g) || [];
+    // More robust regex for DDG links
+    const resultMatches = html.match(/uddg=([^"&']+)["&']/g) || [];
     const ddgUrls = resultMatches
       .map((match) => {
-        const encoded = match.replace("uddg=", "");
+        let encoded = match.replace("uddg=", "").replace(/["&']$/, "");
         try {
           return decodeURIComponent(encoded);
         } catch {
@@ -45,7 +49,7 @@ export async function searchWeb(query) {
       .filter(
         (url) => url && url.startsWith("http") && !url.includes("duckduckgo.com")
       )
-      .slice(0, 8);
+      .slice(0, 10);
 
     urls.push(...ddgUrls.filter(url => url !== null));
   } catch (error) {
@@ -67,54 +71,94 @@ export async function searchWeb(query) {
       }
     }
   } catch (error) {
-    console.error("CrossRef search error:", error);
+    // console.error("CrossRef search error:", error);
   }
 
   return [...new Set(urls)].slice(0, 10);
 }
 
-export async function fetchPageContent(url) {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+const COMMON_USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
+];
 
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-      },
-      signal: controller.signal,
-    });
+export async function fetchPageContent(url, retries = 1) {
+  const userAgent = COMMON_USER_AGENTS[Math.floor(Math.random() * COMMON_USER_AGENTS.length)];
+  
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-    clearTimeout(timeoutId);
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": userAgent,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Cache-Control": "max-age=0",
+          "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+          "Sec-Ch-Ua-Mobile": "?0",
+          "Sec-Ch-Ua-Platform": '"Windows"',
+          "Sec-Fetch-Dest": "document",
+          "Sec-Fetch-Mode": "navigate",
+          "Sec-Fetch-Site": "cross-site",
+          "Sec-Fetch-User": "?1",
+          "Upgrade-Insecure-Requests": "1",
+          "Referer": "https://www.google.com/"
+        },
+        signal: controller.signal,
+      });
 
-    if (!response.ok) {
-      console.log(`Failed to fetch ${url}: ${response.status}`);
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        if (response.status === 403) {
+          // Some sites are just very hard to scrape without a real browser
+          // console.log(`Access Forbidden (403) for ${url}`);
+          return "";
+        }
+        console.log(`Failed to fetch ${url}: ${response.status}`);
+        return "";
+      }
+
+      const html = await response.text();
+
+      // Better HTML cleaning
+      let text = html
+        .replace(/<script[^>]*>.*?<\/script>/gis, " ")
+        .replace(/<style[^>]*>.*?<\/style>/gis, " ")
+        .replace(/<nav[^>]*>.*?<\/nav>/gis, " ")
+        .replace(/<header[^>]*>.*?<\/header>/gis, " ")
+        .replace(/<footer[^>]*>.*?<\/footer>/gis, " ")
+        .replace(/<aside[^>]*>.*?<\/aside>/gis, " ")
+        .replace(/<form[^>]*>.*?<\/form>/gis, " ")
+        .replace(/<svg[^>]*>.*?<\/svg>/gis, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&[a-z0-9]+;/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      return text.slice(0, 8000);
+    } catch (error) {
+      const isTransient = error.code === 'EAI_FAIL' || error.code === 'ENOTFOUND' || error.name === 'AbortError' || error.code === 'ECONNRESET';
+      
+      if (isTransient && i < retries) {
+        // console.log(`Retrying ${url} due to ${error.code || error.name}...`);
+        await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+        continue;
+      }
+      
+      if (error.name !== 'AbortError') {
+        console.error(`Error fetching ${url}:`, error.message || error);
+      } else {
+        console.log(`Timeout fetching ${url}`);
+      }
       return "";
     }
-
-    const html = await response.text();
-
-    let text = html
-      .replace(/<script[^>]*>.*?<\/script>/gis, "")
-      .replace(/<style[^>]*>.*?<\/style>/gis, "")
-      .replace(/<nav[^>]*>.*?<\/nav>/gis, "")
-      .replace(/<header[^>]*>.*?<\/header>/gis, "")
-      .replace(/<footer[^>]*>.*?<\/footer>/gis, "")
-      .replace(/<aside[^>]*>.*?<\/aside>/gis, "")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&[a-z]+;/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    return text.slice(0, 5000);
-  } catch (error) {
-    console.error(`Error fetching ${url}:`, error);
-    return "";
   }
+  return "";
 }
 
 export function nGramSimilarity(text1, text2, n = 5) {
