@@ -7,6 +7,7 @@ import { Loader2, FileSearch, AlertCircle, Upload, FileText, X, ChevronLeft, Ext
 import * as pdfjsLib from "pdfjs-dist";
 import Mark from "mark.js";
 import JSZip from "jszip";
+import mammoth from "mammoth";
 
 // Set up PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -47,6 +48,26 @@ const TEXT_LAYER_CSS = `
 .textLayer .mark-highlight {
   color: transparent;
   pointer-events: auto;
+}
+.mark-red {
+  background-color: rgba(239, 68, 68, 0.25);
+  border-bottom: 2px solid #ef4444;
+  color: #b91c1c !important;
+}
+.mark-orange {
+  background-color: rgba(249, 115, 22, 0.25);
+  border-bottom: 2px solid #f97316;
+}
+.mark-yellow {
+  background-color: rgba(234, 179, 8, 0.25);
+  border-bottom: 2px solid #eab308;
+}
+.docx-viewer {
+  font-family: 'Times New Roman', Times, serif;
+  line-height: 1.6;
+}
+.docx-viewer p {
+  margin-bottom: 1rem;
 }
 `;
 
@@ -171,6 +192,9 @@ const Index = () => {
   const [zoom, setZoom] = useState(1.1);
   const [isDragActive, setIsDragActive] = useState(false);
   const [checkProgress, setCheckProgress] = useState(0);
+  const [docxHtml, setDocxHtml] = useState("");
+  const [startTime, setStartTime] = useState(null);
+  const [estimatedTimeLeft, setEstimatedTimeLeft] = useState("");
 
   const findingsRefs = useRef([]);
   const docHighlightsRefs = useRef({});
@@ -210,37 +234,11 @@ const Index = () => {
         }
         setText(fullText);
       } else if (extension === 'docx') {
-        const zip = await JSZip.loadAsync(arrayBuffer);
-        const docXml = await zip.file("word/document.xml").async("text");
+        const result = await mammoth.convertToHtml({ arrayBuffer });
+        setDocxHtml(result.value);
         
-        // Split by page breaks to skip first 2 pages
-        const pageBreaks = /<w:lastRenderedPageBreak\s*\/>|<w:br[^>]*w:type="page"[^>]*\/>/g;
-        const pages = docXml.split(pageBreaks);
-        
-        let targetXml = docXml;
-        if (pages.length > 2) {
-          targetXml = pages.slice(2).join(" ");
-        }
-        
-        // Extract paragraphs and text
-        const paragraphsRegex = /<w:p\b[^>]*>([\s\S]*?)<\/w:p>/g;
-        let fullText = "";
-        let pMatch;
-        while ((pMatch = paragraphsRegex.exec(targetXml)) !== null) {
-          const pContent = pMatch[1];
-          const textRegex = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
-          let tMatch;
-          let pText = "";
-          while ((tMatch = textRegex.exec(pContent)) !== null) {
-            pText += tMatch[1];
-          }
-          if (pText.trim()) {
-            fullText += pText + "\n";
-          }
-        }
-        
-        fullText = fullText.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
-        setText(fullText);
+        const textResult = await mammoth.extractRawText({ arrayBuffer });
+        setText(textResult.value);
       } else if (extension === 'doc') {
         const formData = new FormData();
         formData.append("file", file);
@@ -252,15 +250,7 @@ const Index = () => {
         
         if (!response.ok) throw new Error("Failed to extract text from DOC");
         const data = await response.json();
-        const docText = data.text;
-        
-        // Split by simple form feed / page break if present or just estimate
-        const pages = docText.split(/\x0C/); // 0x0C is form feed (page break)
-        if (pages.length > 2) {
-          setText(pages.slice(2).join("\n"));
-        } else {
-          setText(docText);
-        }
+        setText(data.text);
       }
     } catch (error) {
       console.error(error);
@@ -302,8 +292,10 @@ const Index = () => {
   const handleCheck = async () => {
     if (!text.trim()) return;
     setIsChecking(true);
-    setCheckProgress(0);
-    setResult(null);
+    const start = Date.now();
+    setStartTime(start);
+    setEstimatedTimeLeft("Pending...");
+    
     try {
       const response = await fetch('/api/plagiarism-check', {
         method: 'POST',
@@ -333,7 +325,23 @@ const Index = () => {
             try {
               const data = JSON.parse(line);
               if (data.type === 'progress') {
-                setCheckProgress(data.progress);
+                const prog = data.progress;
+                setCheckProgress(prog);
+                
+                // Calculate time estimation
+                if (prog > 0) {
+                  const elapsed = (Date.now() - start) / 1000;
+                  const estimatedTotal = (elapsed / prog) * 100;
+                  const remaining = Math.max(0, estimatedTotal - elapsed);
+                  
+                  if (remaining > 60) {
+                    const mins = Math.floor(remaining / 60);
+                    const secs = Math.floor(remaining % 60);
+                    setEstimatedTimeLeft(`${mins}m ${secs}s`);
+                  } else {
+                    setEstimatedTimeLeft(`${Math.floor(remaining)}s`);
+                  }
+                }
               } else if (data.type === 'complete') {
                 setResult(data.result);
               } else if (data.type === 'error') {
@@ -352,6 +360,39 @@ const Index = () => {
       setCheckProgress(0);
     }
   };
+
+  useEffect(() => {
+    if (!result || !docxHtml) return;
+    
+    const container = document.querySelector(".docx-viewer");
+    if (!container) return;
+
+    const instance = new Mark(container);
+    instance.unmark();
+
+    result.results.forEach((r, idx) => {
+      if (r.similarity >= 40) {
+        let colorClass = "mark-yellow";
+        if (r.similarity > 60) colorClass = "mark-red";
+        else if (r.similarity > 40) colorClass = "mark-orange";
+
+        instance.mark(r.sentence, {
+          className: `mark-highlight cursor-pointer transition-all duration-300 ${colorClass}`,
+          accuracy: "partially",
+          acrossElements: true,
+          each: (node) => {
+            node.setAttribute("data-finding-idx", idx);
+            node.onclick = () => scrollToHighlight(idx);
+            
+            // Save ref for scrolling if it's the first occurrence
+            if (!docHighlightsRefs.current[idx]) {
+              docHighlightsRefs.current[idx] = node;
+            }
+          }
+        });
+      }
+    });
+  }, [result, docxHtml]);
 
   const scrollToFinding = (idx) => {
     setActiveFindingIdx(idx);
@@ -420,29 +461,45 @@ const Index = () => {
                         />
                       ))
                     ) : (fileType === 'docx' || fileType === 'doc') ? (
-                      <div className="w-full max-w-4xl mx-auto bg-white p-12 shadow-2xl border mb-12">
-                         <div className="mb-8 p-4 bg-blue-50 border-l-4 border-blue-500 text-blue-700 font-medium">
-                           {fileType.toUpperCase()} Viewer Mode - Note: First 2 pages (Introductory content) have been skipped.
-                         </div>
-                         <div className="space-y-4 text-lg leading-relaxed whitespace-pre-wrap">
-                           {text.split('\n').map((paragraph, i) => {
-                             if (!paragraph.trim()) return null;
-                             // Very basic highlighting for docx text display based on results
-                             let highlightedParagraph = <>{paragraph}</>;
-                             if (result.results) {
-                               const matches = result.results.filter(r => r.similarity >= 40 && paragraph.toLowerCase().includes(r.sentence.toLowerCase()));
-                               if (matches.length > 0) {
-                                  // For simplicity, just tint the paragraph if it has a match
-                                  const maxSim = Math.max(...matches.map(m => m.similarity));
-                                  let colorClass = "bg-yellow-200/50";
-                                  if (maxSim > 50) colorClass = "bg-red-200/50";
-                                  else if (maxSim > 25) colorClass = "bg-orange-200/50";
+                      <div className="w-full max-w-4xl mx-auto bg-white p-12 shadow-2xl border mb-12 docx-viewer">
+                         <div className="prose prose-slate max-w-none dark:prose-invert">
+                            {docxHtml ? (
+                              <div dangerouslySetInnerHTML={{ __html: docxHtml }} />
+                            ) : (
+                              <div className="space-y-4 text-lg leading-relaxed whitespace-pre-wrap">
+                                {text.split('\n').map((paragraph, i) => {
+                                  if (!paragraph.trim()) return null;
                                   
-                                  highlightedParagraph = <span className={colorClass}>{paragraph}</span>;
-                               }
-                             }
-                             return <p key={i}>{highlightedParagraph}</p>;
-                           })}
+                                  let content = paragraph;
+                                  let isPlagiarized = false;
+                                  let colorClass = "";
+
+                                  if (result.results) {
+                                    // Find any matching sentences within this paragraph
+                                    const matches = result.results.filter(r => {
+                                      if (r.similarity < 40) return false;
+                                      const normP = paragraph.toLowerCase().replace(/[^a-z0-9]/g, '');
+                                      const normS = r.sentence.toLowerCase().replace(/[^a-z0-9]/g, '');
+                                      return normP.includes(normS) || paragraph.toLowerCase().includes(r.sentence.toLowerCase());
+                                    });
+
+                                    if (matches.length > 0) {
+                                      isPlagiarized = true;
+                                      const maxSim = Math.max(...matches.map(m => m.similarity));
+                                      colorClass = "bg-yellow-200/50 border-b border-yellow-400";
+                                      if (maxSim > 60) colorClass = "bg-red-200/50 border-b border-red-400 text-red-600";
+                                      else if (maxSim > 40) colorClass = "bg-orange-200/50 border-b border-orange-400";
+                                    }
+                                  }
+
+                                  return (
+                                    <p key={i} className={`p-1 rounded transition-colors ${isPlagiarized ? colorClass : ''}`}>
+                                      {paragraph}
+                                    </p>
+                                  );
+                                })}
+                              </div>
+                            )}
                          </div>
                       </div>
                     ) : (
@@ -543,8 +600,8 @@ const Index = () => {
           <div className="space-y-2">
             <Progress value={checkProgress} className="h-3 bg-slate-100" indicatorClassName="bg-primary transition-all duration-300" />
             <div className="flex justify-between text-xs font-bold text-slate-500 uppercase tracking-widest">
-              <span>{checkProgress}% Complete</span>
-              <span>{100 - checkProgress}% Remaining</span>
+              <span>{checkProgress}% • {estimatedTimeLeft && `Est: ${estimatedTimeLeft}`}</span>
+              <span>{100 - checkProgress}% Left</span>
             </div>
           </div>
         </Card>

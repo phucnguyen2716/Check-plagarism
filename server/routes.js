@@ -31,72 +31,115 @@ export function registerRoutes(app) {
       console.log("Starting plagiarism check for text length:", text.length);
 
       const sentences = text
-        .split(/[.!?]+/)
+        .split(/[.!?\n]+/)
         .map((s) => s.trim())
-        .filter((s) => s.length > 20);
+        .filter((s) => s.length > 60); // Increased minimum length to 60 for better results and speed
 
       console.log("Split into", sentences.length, "sentences");
 
+      // Adaptive sampling for very long documents
+      let checkEvery = 1;
+      if (sentences.length > 300) {
+        checkEvery = 3;
+      } else if (sentences.length > 100) {
+        checkEvery = 2;
+      }
+
+      const sentencesToCheck = sentences.filter((_, idx) => idx % checkEvery === 0);
+      console.log(`Sampling: checking ${sentencesToCheck.length}/${sentences.length} sentences (every ${checkEvery}th)`);
+
       const results = [];
-      const limit = sentences.length;
+      const limit = sentencesToCheck.length;
+      
+      // Concurrency limit for parallel processing
+      const CONCURRENCY = 5; 
+      
+      // Local cache for URL content during this request
+      const urlContentCache = new Map();
 
       res.setHeader('Content-Type', 'application/x-ndjson');
       res.setHeader('Transfer-Encoding', 'chunked');
 
-      for (let i = 0; i < limit; i++) {
-        const sentence = sentences[i];
-        console.log("Checking chunk:", sentence.substring(0, 50) + "...");
+      // Process in batches to avoid overwhelming external APIs
+      for (let i = 0; i < limit; i += CONCURRENCY) {
+        const batch = sentencesToCheck.slice(i, i + CONCURRENCY);
+        
+        const batchPromises = batch.map(async (sentence, batchIdx) => {
+          const currentIndex = i + batchIdx;
+          console.log(`Checking chunk ${currentIndex + 1}/${limit}:`, sentence.substring(0, 50) + "...");
 
-        const urls = await searchWeb(sentence);
-        console.log(`Found ${urls.length} URLs to check`);
+          const urls = await searchWeb(sentence);
+          console.log(`Sentence ${currentIndex + 1}: Found ${urls.length} URLs`);
 
-        let maxSimilarity = 0;
-        const matchedSources = [];
+          let maxSimilarity = 0;
+          const matchedSources = [];
 
-        for (const url of urls) {
-          const content = await fetchPageContent(url);
-          if (content && content.length > 100) {
-            const cosineSim = calculateSimilarity(sentence, content);
-            const ngramSim = nGramSimilarity(sentence, content, 5);
+          // Process URLs for this sentence in parallel
+          const urlChecks = urls.map(async (url) => {
+            try {
+              let content = urlContentCache.get(url);
+              if (content === undefined) {
+                content = await fetchPageContent(url);
+                urlContentCache.set(url, content || "");
+              }
 
-            const similarity = Math.max(cosineSim, ngramSim);
+              if (content && content.length > 100) {
+                const cosineSim = calculateSimilarity(sentence, content);
+                const ngramSim = nGramSimilarity(sentence, content, 5);
+                const similarity = Math.max(cosineSim, ngramSim);
 
-            console.log(
-              `URL ${url}: cosine=${cosineSim.toFixed(2)}, ngram=${ngramSim.toFixed(
-                2
-              )}, max=${similarity.toFixed(2)}`
-            );
-
-            if (similarity > maxSimilarity) {
-              maxSimilarity = similarity;
+                if (similarity > 0.15) {
+                  return { url, similarity };
+                }
+              }
+            } catch (err) {
+              // Ignore individual fetch errors
             }
+            return null;
+          });
 
-            if (similarity > 0.15) {
-              matchedSources.push({
-                url,
-                similarity: Math.round(similarity * 100),
-              });
+          const urlResults = (await Promise.all(urlChecks)).filter(r => r !== null);
+          
+          urlResults.forEach(r => {
+            if (r.similarity > maxSimilarity) {
+              maxSimilarity = r.similarity;
             }
-          }
-        }
+            matchedSources.push({
+              url: r.url,
+              similarity: Math.round(r.similarity * 100),
+            });
+          });
 
-        matchedSources.sort((a, b) => b.similarity - a.similarity);
+          matchedSources.sort((a, b) => b.similarity - a.similarity);
 
-        results.push({
-          sentence,
-          similarity: Math.round(maxSimilarity * 100),
-          sources: matchedSources,
-          isPlagiarized: maxSimilarity > 0.5,
+          const result = {
+            sentence,
+            similarity: Math.round(maxSimilarity * 100),
+            sources: matchedSources.slice(0, 5), // Keep top 5 sources
+            isPlagiarized: maxSimilarity > 0.4, // Lowered threshold slightly for better detection
+          };
+
+          return { index: currentIndex, result };
         });
 
-        res.write(JSON.stringify({ type: 'progress', progress: Math.round(((i + 1) / limit) * 100) }) + '\n');
+        const batchResults = await Promise.all(batchPromises);
+        
+        batchResults.forEach(item => {
+          results[item.index] = item.result;
+        });
 
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const progress = Math.round((Math.min(i + CONCURRENCY, limit) / limit) * 100);
+        res.write(JSON.stringify({ type: 'progress', progress }) + '\n');
+        
+        // Small delay between batches to respect rate limits
+        if (i + CONCURRENCY < limit) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
 
-      const totalSimilarity = results.reduce((sum, r) => sum + r.similarity, 0);
+      const totalSimilarity = results.reduce((sum, r) => sum + (r?.similarity || 0), 0);
       const overallScore = Math.round(totalSimilarity / results.length);
-      const plagiarizedCount = results.filter((r) => r.isPlagiarized).length;
+      const plagiarizedCount = results.filter((r) => r?.isPlagiarized).length;
       const plagiarismPercentage = Math.round(
         (plagiarizedCount / results.length) * 100
       );
@@ -108,7 +151,7 @@ export function registerRoutes(app) {
         plagiarismPercentage,
         totalSentences: results.length,
         plagiarizedSentences: plagiarizedCount,
-        results,
+        results: results.filter(Boolean),
       };
 
       res.write(JSON.stringify({ type: 'complete', result: checkResult }) + '\n');
